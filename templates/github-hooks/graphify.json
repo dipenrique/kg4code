@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "f=\"$(git rev-parse --show-toplevel 2>/dev/null)/.githooks/kg-hook.sh\"; if [ -f \"$f\" ]; then sh \"$f\" guard search; else echo '{}'; fi",
+        "timeoutSec": 5
+      },
+      {
+        "type": "command",
+        "bash": "f=\"$(git rev-parse --show-toplevel 2>/dev/null)/.githooks/kg-hook.sh\"; if [ -f \"$f\" ]; then sh \"$f\" guard read; else echo '{}'; fi",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}

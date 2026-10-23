@@ -1,0 +1,793 @@
+#!/usr/bin/env bash
+# kg-setup: one-command setup of self-updating knowledge graphs
+# (graphify + code-review-graph) for GitHub Copilot (VS Code chat, Copilot CLI)
+# and Claude Code, in any git repo or multi-root VS Code workspace.
+#
+# Idempotent: re-run it any time to repair or upgrade. Before touching a file,
+# it backs the file up to ~/.cache/kg-kit/backups/<timestamp>/ and records it
+# in a manifest that `kg-setup restore <dir>` replays.
+#
+# Compatible with bash 3.2 (macOS system bash). Needs git, jq and perl.
+set -u
+
+# --------------------------------------------------------------- locate kit --
+_self=$0
+while [ -L "$_self" ]; do
+  _d=$(cd "$(dirname "$_self")" && pwd)
+  _self=$(readlink "$_self")
+  case "$_self" in /*) ;; *) _self="$_d/$_self" ;; esac
+done
+KIT_DIR=$(cd "$(dirname "$_self")/.." && pwd)
+KIT_VERSION=$(cat "$KIT_DIR/VERSION" 2>/dev/null || echo dev)
+TPL="$KIT_DIR/templates"
+
+CRG_TOOLS_DEFAULT="semantic_search_nodes_tool,query_graph_tool,get_impact_radius_tool,get_review_context_tool,detect_changes_tool,get_affected_flows_tool,traverse_graph_tool,list_communities_tool,get_community_tool,list_graph_stats_tool,refactor_tool"
+KG_CRG_TOOLS="${KG_CRG_TOOLS:-$CRG_TOOLS_DEFAULT}"   # "all" = expose every CRG MCP tool
+GIT_HOOKS="post-commit post-checkout post-merge post-rewrite"
+GRAPH_RE='code-review-graph|graphify|kg-hook[.]sh'   # valid in both grep -E and jq
+
+DRY=0 YES=0 BUILD=1 CLAUDE=auto USER_CFG=1 TOOLS=1 WS=1 FORCE=0 MCP=1 PURGE=0
+TS=$(date +%Y%m%d-%H%M%S)
+BK="${KG_KIT_BACKUP_DIR:-$HOME/.cache/kg-kit/backups}/$TS"
+MANIFEST="$BK/manifest.txt"
+NCHANGES=0 NFAIL=0 CUR_REPO=""
+CRG_BIN="" GFY_BIN=""
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/kg-setup.XXXXXX") || exit 1
+trap 'rm -rf "$WORK"' EXIT
+REPO_LIST="$WORK/repos" WS_LIST="$WORK/workspaces"
+: > "$REPO_LIST"; : > "$WS_LIST"
+
+# ------------------------------------------------------------------- output --
+if [ -t 1 ]; then
+  C_B=$'\033[1m' C_G=$'\033[32m' C_Y=$'\033[33m' C_R=$'\033[31m' C_D=$'\033[2m' C_N=$'\033[0m'
+else
+  C_B="" C_G="" C_Y="" C_R="" C_D="" C_N=""
+fi
+title() { printf '\n%s== %s%s\n' "$C_B" "$*" "$C_N"; }
+act()   { NCHANGES=$((NCHANGES + 1)); printf '  %s%-15s%s %s\n' "$C_G" "$1" "$C_N" "$2"; }
+note()  { printf '  %s%s%s\n' "$C_D" "$*" "$C_N"; }
+warn()  { printf '  %swarning:%s %s\n' "$C_Y" "$C_N" "$*"; }
+die()   { printf '%serror:%s %s\n' "$C_R" "$C_N" "$*" >&2; exit 1; }
+info()  { printf '  %s%-15s%s %s\n' "$C_D" "$1" "$C_N" "$2"; }   # progress, not a change
+ok()    { printf '  %sok%s    %s\n' "$C_G" "$C_N" "$*"; }
+bad()   { NFAIL=$((NFAIL + 1)); printf '  %sFAIL%s  %s\n' "$C_R" "$C_N" "$*"; }
+
+rel() {
+  case "$1" in
+    "$CUR_REPO"/*) [ -n "$CUR_REPO" ] && { printf '%s' "${1#"$CUR_REPO"/}"; return; } ;;
+  esac
+  case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac
+}
+
+confirm() {
+  [ "$YES" = 1 ] && return 0
+  [ -r /dev/tty ] && [ -t 1 ] || return 0
+  printf '%s [Y/n] ' "$1"
+  read -r _a < /dev/tty || return 0
+  case "$_a" in n|N|no|NO) return 1 ;; esac
+  return 0
+}
+
+# ------------------------------------------------------- backup / file ops --
+backup_file() {   # <abs path>: record once per run
+  [ "$DRY" = 1 ] && return 0
+  mkdir -p "$BK" || return 0
+  grep -qxF "modified $1" "$MANIFEST" 2>/dev/null && return 0
+  grep -qxF "created $1" "$MANIFEST" 2>/dev/null && return 0
+  if [ -e "$1" ]; then
+    mkdir -p "$BK/files$(dirname "$1")" && cp -p "$1" "$BK/files$1"
+    echo "modified $1" >> "$MANIFEST"
+  else
+    echo "created $1" >> "$MANIFEST"
+  fi
+}
+
+# set_hooks_path <repo> set|unset: change core.hooksPath and record it so restore can revert
+set_hooks_path() {
+  if [ "$DRY" = 1 ]; then act "[dry] git config" "$([ "$2" = set ] && echo 'core.hooksPath .githooks' || echo '--unset core.hooksPath')"; return 0; fi
+  mkdir -p "$BK" && echo "hookspath-$2 $1" >> "$MANIFEST"
+  if [ "$2" = set ]; then
+    git -C "$1" config core.hooksPath .githooks && git -C "$1" config kg-kit.hookspathset true
+    act "git config" "core.hooksPath .githooks"
+  else
+    git -C "$1" config --unset core.hooksPath; git -C "$1" config --unset kg-kit.hookspathset
+    act "git config" "--unset core.hooksPath"
+  fi
+}
+
+put_file() {      # <src> <dest> [755|644]: write only when content differs
+  _src=$1 _dst=$2 _mode=${3:-}
+  if [ -f "$_dst" ] && cmp -s "$_src" "$_dst"; then
+    if [ "$_mode" = 755 ] && [ ! -x "$_dst" ]; then
+      if [ "$DRY" = 1 ]; then act "[dry] chmod +x" "$(rel "$_dst")"; else chmod 755 "$_dst"; act "chmod +x" "$(rel "$_dst")"; fi
+    fi
+    return 0
+  fi
+  if [ -e "$_dst" ]; then _v=update; else _v=create; fi
+  if [ "$DRY" = 1 ]; then act "[dry] $_v" "$(rel "$_dst")"; return 0; fi
+  backup_file "$_dst"
+  mkdir -p "$(dirname "$_dst")" && cat "$_src" > "$_dst" || { warn "cannot write $_dst"; return 1; }
+  [ -n "$_mode" ] && chmod "$_mode" "$_dst"
+  act "${_v}d" "$(rel "$_dst")"
+}
+
+remove_file() {   # <abs path>
+  [ -e "$1" ] || return 0
+  if [ "$DRY" = 1 ]; then act "[dry] remove" "$(rel "$1")"; return 0; fi
+  backup_file "$1"; rm -f "$1"; act "removed" "$(rel "$1")"
+  rmdir -p "$(dirname "$1")" 2> /dev/null   # drop parents left empty; stops at the first non-empty one
+  return 0
+}
+
+# strip_block <file> <start-regex> <end-regex>: delete marker blocks in place.
+strip_block() {
+  awk -v s="$2" -v e="$3" '$0 ~ s { skip = 1; next } skip { if ($0 ~ e) skip = 0; next } { print }' \
+    "$1" > "$1.kgtmp" && mv "$1.kgtmp" "$1"
+}
+
+trim_trailing_blank() { [ -s "$1" ] && perl -0pi -e 's/\n*\z/\n/' "$1"; return 0; }
+
+# upsert_text_block <file> <start-regex> <end-regex> <block-file> [defaults-file]
+upsert_text_block() {
+  _t="$WORK/blk.$$"
+  if [ -f "$1" ]; then cat "$1" > "$_t"; elif [ -n "${5:-}" ]; then cat "$5" > "$_t"; else : > "$_t"; fi
+  strip_block "$_t" "$2" "$3"
+  trim_trailing_blank "$_t"
+  if [ -s "$_t" ]; then cat "$4" >> "$_t"; else sed '1{/^$/d;}' "$4" > "$_t"; fi
+  put_file "$_t" "$1"
+}
+
+# remove_text_block <file> <start-regex> <end-regex> [defaults-file]
+# Deletes the file when nothing (or only the kit-seeded defaults) remains.
+remove_text_block() {
+  [ -f "$1" ] || return 0
+  _t="$WORK/blk.$$"; cat "$1" > "$_t"
+  strip_block "$_t" "$2" "$3"; trim_trailing_blank "$_t"
+  if [ -z "$(grep -v '^[[:space:]]*$' "$_t")" ] || { [ -n "${4:-}" ] && cmp -s "$_t" "$4"; }; then
+    remove_file "$1"; return 0
+  fi
+  put_file "$_t" "$1"
+}
+
+# ------------------------------------------------------------------- JSON --
+json_ok() { jq -e . "$1" > /dev/null 2>&1; }
+
+# json_apply <file> <filter> [jq args...]: 0 ok, 2 file is JSONC (left untouched).
+json_apply() {
+  _f=$1 _flt=$2; shift 2
+  _t="$WORK/json.$$"
+  if [ -f "$_f" ]; then
+    json_ok "$_f" || return 2
+    jq "$@" "$_flt" "$_f" > "$_t" 2> /dev/null || { warn "jq failed on $(rel "$_f")"; return 1; }
+    [ "$(jq -S . "$_f")" = "$(jq -S . "$_t")" ] && return 0
+  else
+    echo '{}' | jq "$@" "$_flt" > "$_t" 2> /dev/null || { warn "jq failed for $(rel "$_f")"; return 1; }
+  fi
+  put_file "$_t" "$_f"
+}
+
+# jsonc_set <file> <key> <json-value> [workspace]: comment-tolerant top-level (or
+# "settings" object, for *.code-workspace) key upsert that keeps formatting.
+jsonc_set() {
+  _f=$1
+  if [ ! -f "$_f" ]; then
+    if [ "${4:-}" = workspace ]; then printf '{\n\t"settings": {\n\t\t"%s": %s\n\t}\n}\n' "$2" "$3" > "$WORK/jc"
+    else printf '{\n  "%s": %s\n}\n' "$2" "$3" > "$WORK/jc"; fi
+    put_file "$WORK/jc" "$_f"; return
+  fi
+  if [ "${4:-}" != workspace ] && json_ok "$_f"; then
+    json_apply "$_f" '.[$k] = $v' --arg k "$2" --argjson v "$3"; return
+  fi
+  K="$2" V="$3" MODE="${4:-plain}" perl -0777 -pe '
+    my $k = quotemeta $ENV{K}; my $v = $ENV{V}; my $raw = $ENV{K};
+    my $val = qr/(?:true|false|null|-?\d+(?:\.\d+)?|"[^"]*")/;
+    if (/"$k"\s*:\s*$val/) { s/("$k"\s*:\s*)$val/$1$v/; }
+    elsif ($ENV{MODE} eq "workspace") {
+      if    (/"settings"\s*:\s*\{\s*\}/) { s/"settings"\s*:\s*\{\s*\}/"settings": {\n\t\t"$raw": $v\n\t}/; }
+      elsif (/"settings"\s*:\s*\{/)      { s/("settings"\s*:\s*\{)/$1\n\t\t"$raw": $v,/; }
+      else                               { s/\{/{\n\t"settings": {\n\t\t"$raw": $v\n\t},/; }
+    }
+    elsif (/\A\s*\{\s*\}\s*\z/) { $_ = "{\n  \"$raw\": $v\n}\n"; }
+    else { s/\{/{\n  "$raw": $v,/; }
+  ' "$_f" > "$WORK/jc" && put_file "$WORK/jc" "$_f"
+}
+
+# Claude-format hook surgery: drop graph hooks, optionally add the template's.
+JQ_STRIP='def g: tostring | test("'"$GRAPH_RE"'");
+def clean: if type == "object" and (.hooks | type) == "array"
+    then (.hooks |= map(select(g | not))) | select((.hooks | length) > 0)
+    else select(g | not) end;
+def strip: if (.hooks | type) == "object" then
+    .hooks |= (with_entries(.value |= (if type == "array" then map(clean) else . end))
+               | with_entries(select((.value | type) != "array" or (.value | length) > 0)))
+    | if (.hooks | length) == 0 then del(.hooks) else . end
+  else . end;'
+JQ_CLAUDE_ADD="$JQ_STRIP"' strip | .hooks = ((.hooks // {}) as $h
+  | reduce ($t[0] | keys_unsorted[]) as $k ($h; .[$k] = ((.[$k] // []) + $t[0][$k])))'
+JQ_CLAUDE_DEL="$JQ_STRIP strip"
+
+# ------------------------------------------------------------------- tools --
+find_bin() {
+  command -v "$1" 2> /dev/null && return 0
+  for _d in "$HOME/.local/bin" "$HOME/miniconda3/bin" "$HOME/anaconda3/bin" "$HOME/miniforge3/bin" \
+            /opt/homebrew/bin /usr/local/bin; do
+    [ -x "$_d/$1" ] && { printf '%s\n' "$_d/$1"; return 0; }
+  done
+  return 1
+}
+
+need_base() {
+  for _c in git jq perl awk; do
+    command -v "$_c" > /dev/null 2>&1 || die "'$_c' is required (macOS: brew install $_c, Debian/Ubuntu: apt install $_c)"
+  done
+}
+
+ensure_tools() {
+  need_base
+  CRG_BIN=$(find_bin code-review-graph) || CRG_BIN=""
+  GFY_BIN=$(find_bin graphify) || GFY_BIN=""
+  [ -n "$CRG_BIN" ] && [ -n "$GFY_BIN" ] && return 0
+  _miss=""; [ -n "$CRG_BIN" ] || _miss="code-review-graph"; [ -n "$GFY_BIN" ] || _miss="$_miss graphify"
+  [ "$TOOLS" = 1 ] || die "missing:$_miss (install them, or drop --no-tools)"
+  if [ "$DRY" = 1 ]; then
+    act "[dry] install" "$_miss"; CRG_BIN=${CRG_BIN:-code-review-graph}; GFY_BIN=${GFY_BIN:-graphify}; return 0
+  fi
+  title "Installing missing CLIs:$_miss"
+  for _p in $_miss; do
+    _pkg=$_p; [ "$_p" = graphify ] && _pkg=graphifyy        # PyPI name of graphify
+    if command -v uv > /dev/null 2>&1; then uv tool install "$_pkg" < /dev/null
+    elif command -v pipx > /dev/null 2>&1; then pipx install "$_pkg" < /dev/null
+    else python3 -m pip install --user "$_pkg" < /dev/null
+    fi || warn "installing $_pkg failed"
+  done
+  CRG_BIN=$(find_bin code-review-graph) || die "code-review-graph still missing (try: uv tool install code-review-graph)"
+  GFY_BIN=$(find_bin graphify) || die "graphify still missing (try: uv tool install graphifyy)"
+  act "installed" "$_miss"
+}
+
+crg_args_json() {   # <repo or ""> -> JSON array of `serve` args
+  jq -cn --arg r "$1" --arg t "$KG_CRG_TOOLS" \
+    '["serve"] + (if $r == "" then [] else ["--repo", $r] end) + (if $t == "all" then [] else ["--tools", $t] end)'
+}
+
+# ----------------------------------------------------------------- targets --
+toplevel() { [ -d "$1" ] && git -C "$1" rev-parse --show-toplevel 2> /dev/null; }
+
+add_repo() { grep -qxF "$1" "$REPO_LIST" || printf '%s\n' "$1" >> "$REPO_LIST"; }
+
+add_ws() {
+  _ws=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+  grep -qxF "$_ws" "$WS_LIST" || printf '%s\n' "$_ws" >> "$WS_LIST"
+  _wd=$(dirname "$_ws")
+  sed -n 's/.*"path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_ws" | while IFS= read -r _p; do
+    case "$_p" in /*) _abs=$_p ;; *) _abs="$_wd/$_p" ;; esac
+    _top=$(toplevel "$_abs") && add_repo "$_top" || printf '  %sskip%s  %s (not a git repo)\n' "$C_Y" "$C_N" "$_abs"
+  done
+}
+
+collect_targets() {
+  [ $# -gt 0 ] || set -- .
+  for _a in "$@"; do
+    case "$_a" in
+      *.code-workspace) if [ -f "$_a" ]; then add_ws "$_a"; else warn "no such workspace file: $_a"; fi ;;
+      *)
+        [ -d "$_a" ] || { warn "no such directory: $_a"; continue; }
+        if _top=$(toplevel "$_a"); then add_repo "$_top"
+        else warn "$_a is not inside a git repo (run 'git init' first); skipped"; continue; fi
+        if [ "$WS" = 1 ]; then
+          for _w in "$_a"/*.code-workspace "$_top"/*.code-workspace; do [ -f "$_w" ] && add_ws "$_w"; done
+        fi
+        ;;
+    esac
+  done
+}
+
+# each_line <file> <function>: iterate without letting callees eat the list on stdin.
+each_line() {
+  _ifs=$IFS; IFS='
+'
+  set -f
+  for _l in $(cat "$1"); do IFS=$_ifs; set +f; "$2" "$_l" < /dev/null; IFS='
+'; set -f; done
+  IFS=$_ifs; set +f
+}
+
+# --------------------------------------------------------- git hooks helpers --
+hooks_dir() {     # <repo>: echo the effective hooks dir (may not exist yet)
+  _hp=$(git -C "$1" config --get core.hooksPath 2> /dev/null)
+  case "$_hp" in
+    "") printf '%s/.githooks\n' "$1" ;;
+    .husky/_|*/.husky/_) printf '%s/.husky\n' "$1" ;;
+    /*) printf '%s\n' "$_hp" ;;
+    *) printf '%s/%s\n' "$1" "$_hp" ;;
+  esac
+}
+
+upsert_git_hook() {   # <hooks-dir> <hook>
+  _f="$1/$2" _t="$WORK/hook.$$"
+  if [ -f "$_f" ]; then cat "$_f" > "$_t"; else printf '#!/bin/sh\n' > "$_t"; fi
+  # Pre-kit installs kept a header above the guard block; it now lives inside it.
+  perl -0pi -e 's/\A(#![^\n]*\n)# Knowledge-graph auto-refresh.*?\n(?=# kg-guard-start)/$1/s' "$_t"
+  strip_block "$_t" '^# kg-guard-start$' '^# kg-guard-end$'
+  strip_block "$_t" '^# kg-crg-start$' '^# kg-crg-end$'
+  head -n 1 "$_t" | grep -q '^#!' || { printf '#!/bin/sh\n' | cat - "$_t" > "$_t.2" && mv "$_t.2" "$_t"; }
+  awk -v p="$TPL/githooks/prelude.sh" 'NR == 1 { print; while ((getline l < p) > 0) print l; next } { print }' \
+    "$_t" > "$_t.2" && mv "$_t.2" "$_t"
+  trim_trailing_blank "$_t"
+  { printf '\n'; sed "s/__HOOK__/$2/" "$TPL/githooks/crg-block.sh"; } >> "$_t"
+  put_file "$_t" "$_f" 755
+}
+
+strip_git_hook() {    # <hooks-dir> <hook>: remove kg + graphify blocks
+  _f="$1/$2" _t="$WORK/hook.$$"
+  [ -f "$_f" ] || return 0
+  cat "$_f" > "$_t"
+  perl -0pi -e 's/\A(#![^\n]*\n)# Knowledge-graph auto-refresh.*?\n(?=# kg-guard-start)/$1/s' "$_t"
+  strip_block "$_t" '^# kg-guard-start$' '^# kg-guard-end$'
+  strip_block "$_t" '^# kg-crg-start$' '^# kg-crg-end$'
+  strip_block "$_t" '^# graphify-([a-z]+-)?hook-start$' '^# graphify-([a-z]+-)?hook-end$'
+  if [ -z "$(grep -v '^#!' "$_t" | grep -v '^[[:space:]]*$')" ]; then remove_file "$_f"
+  else trim_trailing_blank "$_t"; put_file "$_t" "$_f" 755; fi
+}
+
+graph_ignored() { git -C "$1" check-ignore -q graphify-out/graph.json 2> /dev/null; }
+
+# ================================================================== install ==
+install_repo() {
+  _r=$1; CUR_REPO=$_r
+  title "$_r"
+
+  # 1. git must not track the local graph caches
+  if ! graph_ignored "$_r" || ! git -C "$_r" check-ignore -q .code-review-graph/graph.db 2> /dev/null; then
+    upsert_text_block "$_r/.gitignore" '^# kg-gitignore-start' '^# kg-gitignore-end$' "$TPL/ignore/gitignore-block.txt"
+  fi
+
+  # 2. keep agent tooling out of both graphs
+  for _i in .graphifyignore .code-review-graphignore; do
+    upsert_text_block "$_r/$_i" '^# kg-setup-start' '^# kg-setup-end$' "$TPL/ignore/block.txt" "$TPL/ignore/defaults.txt"
+  done
+
+  # 3. shared hook runtime
+  put_file "$TPL/githooks/kg-lib.sh" "$_r/.githooks/kg-lib.sh" 644
+  put_file "$TPL/githooks/kg-hook.sh" "$_r/.githooks/kg-hook.sh" 755
+
+  # 4. git hooks (graphify blocks + kg prelude + CRG block)
+  _hd=$(hooks_dir "$_r")
+  _hp=$(git -C "$_r" config --get core.hooksPath 2> /dev/null)
+  _hpl=$(git -C "$_r" config --local --get core.hooksPath 2> /dev/null)
+  if [ -n "$_hp" ] && [ -z "$_hpl" ]; then
+    warn "core.hooksPath is set outside this repo ($_hp); git hooks skipped so shared/global hooks stay untouched."
+    note "agent hooks still refresh the graphs; to opt in: git -C '$_r' config core.hooksPath .githooks && kg-setup '$_r'"
+  else
+  if [ -z "$_hp" ]; then
+    _old=$(cd "$_r" && cd "$(git rev-parse --git-path hooks)" 2> /dev/null && pwd)
+    for _h in "$_old"/*; do
+      [ -f "$_h" ] && [ -x "$_h" ] || continue
+      case "$_h" in *.sample) continue ;; esac
+      [ -e "$_hd/$(basename "$_h")" ] || { put_file "$_h" "$_hd/$(basename "$_h")" 755; note "carried over existing .git/hooks/$(basename "$_h") (stays active)"; }
+    done
+    set_hooks_path "$_r" set
+  fi
+  _ga_pre=0; [ -f "$_r/.gitattributes" ] && _ga_pre=1
+  _need_gfy=0
+  for _h in $GIT_HOOKS; do grep -q '^# graphify-\([a-z]*-\)\{0,1\}hook-start$' "$_hd/$_h" 2> /dev/null || _need_gfy=1; done
+  if [ "$_need_gfy" = 0 ]; then
+    :
+  elif [ "$DRY" = 1 ]; then
+    act "[dry] run" "graphify hook install"
+  else
+    for _h in $GIT_HOOKS; do backup_file "$_hd/$_h"; done
+    [ "$_ga_pre" = 1 ] && backup_file "$_r/.gitattributes"
+    _before=$(cat "$_hd"/post-* 2> /dev/null | cksum)
+    ( cd "$_r" && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="$_hd" \
+        "$GFY_BIN" hook install ) > "$WORK/gfy.log" 2>&1 < /dev/null || { warn "graphify hook install failed:"; sed 's/^/    /' "$WORK/gfy.log"; }
+    [ "$_before" = "$(cat "$_hd"/post-* 2> /dev/null | cksum)" ] || act "graphify" "hook blocks installed in $(rel "$_hd")"
+    # graphify also registers a graph.json merge driver; useless when graphify-out/ is not committed.
+    if graph_ignored "$_r"; then
+      git -C "$_r" config --unset merge.graphify.driver 2> /dev/null
+      git -C "$_r" config --unset merge.graphify.name 2> /dev/null
+      if [ -f "$_r/.gitattributes" ]; then
+        grep -vxF 'graphify-out/graph.json merge=graphify' "$_r/.gitattributes" > "$WORK/ga" || true
+        if [ "$_ga_pre" = 0 ] && [ ! -s "$WORK/ga" ]; then rm -f "$_r/.gitattributes"
+        elif ! cmp -s "$WORK/ga" "$_r/.gitattributes"; then cat "$WORK/ga" > "$_r/.gitattributes"; fi
+      fi
+    fi
+  fi
+  for _h in $GIT_HOOKS; do upsert_git_hook "$_hd" "$_h"; done
+  fi
+
+  # 5. agent hooks: GitHub Copilot (VS Code + CLI)
+  for _j in code-review-graph.json graphify.json; do
+    _d="$_r/.github/hooks/$_j"
+    [ -f "$_d" ] && ! grep -q 'kg-hook.sh' "$_d" && note "replacing pre-kit $(rel "$_d") (backed up)"
+    put_file "$TPL/github-hooks/$_j" "$_d"
+  done
+
+  # 6. Claude Code hooks (Copilot reads these too; duplicates are de-duplicated at runtime)
+  _claude=0
+  case "$CLAUDE" in yes) _claude=1 ;; auto) [ -d "$_r/.claude" ] && _claude=1 ;; esac
+  if [ "$_claude" = 1 ]; then
+    json_apply "$_r/.claude/settings.json" "$JQ_CLAUDE_ADD" --slurpfile t "$TPL/claude/hooks.json" \
+      || [ $? != 2 ] || warn "$(rel "$_r/.claude/settings.json") has comments; add hooks from $TPL/claude/hooks.json by hand"
+  fi
+  if [ -f "$_r/.claude/settings.local.json" ] && grep -qE "$GRAPH_RE" "$_r/.claude/settings.local.json"; then
+    json_apply "$_r/.claude/settings.local.json" "$JQ_CLAUDE_DEL"
+  fi
+
+  # 7. VS Code: MCP server bound to this repo; don't double-load .claude hooks
+  if [ "$MCP" = 1 ]; then
+    _m="$_r/.vscode/mcp.json"
+    if ! json_apply "$_m" '.servers = (.servers // {}) | .servers["code-review-graph"] = {type: "stdio", command: $b, args: $a, cwd: $r}' \
+        --arg b "$CRG_BIN" --arg r "$_r" --argjson a "$(crg_args_json "$_r")"; then
+      warn "$(rel "$_m") has comments; add this server by hand:"
+      jq -n --arg b "$CRG_BIN" --arg r "$_r" --argjson a "$(crg_args_json "$_r")" \
+        '{"code-review-graph": {type: "stdio", command: $b, args: $a, cwd: $r}}' | sed 's/^/    /'
+    fi
+    if [ -f "$_m" ] && ! git -C "$_r" check-ignore -q .vscode/mcp.json 2> /dev/null; then
+      note "$(rel "$_m") is not gitignored and holds machine-specific paths; consider ignoring it"
+    fi
+  fi
+  [ "$_claude" = 1 ] && jsonc_set "$_r/.vscode/settings.json" chat.useClaudeHooks false
+
+  # 8. agent instructions + reference doc (only files kg-setup owns, unless --force)
+  _d="$_r/.github/instructions/code-review-graph.instructions.md"
+  if [ ! -f "$_d" ] || [ "$FORCE" = 1 ] || grep -q 'kg-kit:managed\|<!-- code-review-graph MCP tools -->' "$_d"; then
+    put_file "$TPL/instructions/code-review-graph.instructions.md" "$_d"
+  else note "kept custom $(rel "$_d") (--force replaces it)"; fi
+  _d="$_r/docs/agents/knowledge-graph.md"
+  if [ ! -f "$_d" ] || [ "$FORCE" = 1 ] || grep -q 'kg-kit:managed' "$_d"; then
+    put_file "$TPL/docs/knowledge-graph.md" "$_d"
+  else note "kept custom $(rel "$_d") (--force replaces it)"; fi
+
+  # 9. build / refresh both graphs now so the first agent session has them
+  [ "$BUILD" = 1 ] || return 0
+  if [ "$DRY" = 1 ]; then info "[dry] build" "code-review-graph + graphify (refresh)"; return 0; fi
+  mkdir -p "$_r/.code-review-graph"
+  _m=update; [ -f "$_r/.code-review-graph/graph.db" ] || _m=build
+  printf '  %s...%s code-review-graph %s\n' "$C_D" "$C_N" "$_m"
+  KG_CRG_TIMEOUT="${KG_CRG_TIMEOUT:-1800}" KG_CRG_BIN="$CRG_BIN" sh "$_r/.githooks/kg-hook.sh" crg-run "$_r" "$_m" kg-setup > "$WORK/crg.log" 2>&1
+  if [ -f "$_r/.code-review-graph/graph.db" ]; then info "graph" "code-review-graph $_m ok"; else warn "code-review-graph $_m failed:"; tail -5 "$WORK/crg.log" | sed 's/^/    /'; fi
+  printf '  %s...%s graphify update\n' "$C_D" "$C_N"
+  ( cd "$_r" && GRAPHIFY_MAX_WORKERS="${GRAPHIFY_MAX_WORKERS:-2}" PYTHONHASHSEED=0 nice -n 10 "$GFY_BIN" update . ) > "$WORK/gfy.log" 2>&1
+  if [ -f "$_r/graphify-out/graph.json" ]; then info "graph" "graphify update ok"; else warn "graphify update failed:"; tail -5 "$WORK/gfy.log" | sed 's/^/    /'; fi
+}
+
+install_ws() {
+  CUR_REPO=""
+  title "$1"
+  jsonc_set "$1" chat.useClaudeHooks false workspace
+}
+
+install_user() {
+  CUR_REPO=""
+  [ "$USER_CFG" = 1 ] && [ "$MCP" = 1 ] || return 0
+  title "User-level (Copilot CLI)"
+  if [ -d "$HOME/.copilot" ]; then
+    json_apply "$HOME/.copilot/mcp-config.json" \
+      '.mcpServers = (.mcpServers // {}) | .mcpServers["code-review-graph"] = {type: "local", command: $b, args: $a, tools: ["*"]}' \
+      --arg b "$CRG_BIN" --argjson a "$(crg_args_json "")" || warn "~/.copilot/mcp-config.json is not plain JSON; skipped"
+    note "Copilot CLI serves the graph of the repo it is started in"
+  else
+    note "~/.copilot not found (Copilot CLI not installed); skipped"
+  fi
+}
+
+cmd_install() {
+  ensure_tools
+  collect_targets "$@"
+  [ -s "$REPO_LIST" ] || die "no git repositories found"
+  title "kg-setup $KIT_VERSION: install$([ "$DRY" = 1 ] && echo ' (dry run)')"
+  sed 's/^/  repo       /' "$REPO_LIST"
+  [ -s "$WS_LIST" ] && sed 's/^/  workspace  /' "$WS_LIST"
+  [ "$DRY" = 1 ] || confirm "Set up knowledge graphs for the above?" || die "aborted"
+  each_line "$REPO_LIST" install_repo
+  each_line "$WS_LIST" install_ws
+  install_user
+  summary
+  if [ "$DRY" != 1 ] && [ "$NCHANGES" -gt 0 ]; then
+    printf '\nNext: start a new chat session (hooks load at session start), then run\n'
+    printf '  kg-setup doctor    to verify, and commit the tracked files listed by git status.\n'
+  fi
+}
+
+summary() {
+  CUR_REPO=""
+  title "Summary"
+  if [ "$NCHANGES" = 0 ]; then echo "  Everything already up to date."
+  elif [ "$DRY" = 1 ]; then echo "  $NCHANGES change(s) would be made. Re-run without --dry-run to apply."
+  else
+    echo "  $NCHANGES change(s) applied."
+    [ -f "$MANIFEST" ] && echo "  Backup + manifest: $(rel "$BK")   (undo: kg-setup restore $(rel "$BK"))"
+  fi
+  [ -d "$BK" ] && [ ! -f "$MANIFEST" ] && rmdir "$BK" 2> /dev/null
+  return 0
+}
+
+# =================================================================== doctor ==
+doctor_repo() {
+  _r=$1; CUR_REPO=$_r
+  title "$_r"
+  _hd=$(hooks_dir "$_r")
+  [ -n "$(git -C "$_r" config --get core.hooksPath)" ] && ok "core.hooksPath = $(git -C "$_r" config --get core.hooksPath)" \
+    || bad "core.hooksPath not set"
+  for _s in kg-lib.sh kg-hook.sh; do
+    if cmp -s "$TPL/githooks/$_s" "$_r/.githooks/$_s"; then ok ".githooks/$_s (kit $KIT_VERSION)"
+    elif [ -f "$_r/.githooks/$_s" ]; then bad ".githooks/$_s differs from kit $KIT_VERSION (kg-setup install upgrades it)"
+    else bad ".githooks/$_s missing"; fi
+  done
+  for _h in $GIT_HOOKS; do
+    _f="$_hd/$_h"; _miss=""
+    [ -x "$_f" ] || { bad "$(rel "$_f") missing or not executable"; continue; }
+    grep -q '^# kg-guard-start$' "$_f" || _miss="$_miss kg-guard"
+    grep -q '^# graphify-\([a-z]*-\)\{0,1\}hook-start$' "$_f" || _miss="$_miss graphify"
+    grep -q '^# kg-crg-start$' "$_f" || _miss="$_miss kg-crg"
+    [ -z "$_miss" ] && ok "$(rel "$_f")" || bad "$(rel "$_f") lacks:$_miss"
+  done
+  for _j in code-review-graph.json graphify.json; do
+    cmp -s "$TPL/github-hooks/$_j" "$_r/.github/hooks/$_j" && ok ".github/hooks/$_j" || bad ".github/hooks/$_j missing or outdated"
+  done
+  if [ -d "$_r/.claude" ]; then
+    grep -q 'kg-hook.sh' "$_r/.claude/settings.json" 2> /dev/null && ok ".claude/settings.json hooks" || bad ".claude/settings.json lacks kg hooks"
+    if grep -qE "$GRAPH_RE" "$_r/.claude/settings.local.json" 2> /dev/null; then bad ".claude/settings.local.json still has graph hooks (duplicates)"; fi
+  fi
+  if [ -f "$_r/.vscode/mcp.json" ] && grep -q '"code-review-graph"' "$_r/.vscode/mcp.json"; then
+    _c=$(jq -r '.servers["code-review-graph"].command // empty' "$_r/.vscode/mcp.json" 2> /dev/null)
+    [ -z "$_c" ] || [ -x "$_c" ] || command -v "$_c" > /dev/null 2>&1 && ok ".vscode/mcp.json code-review-graph server" \
+      || bad ".vscode/mcp.json command not executable: $_c"
+  else bad ".vscode/mcp.json has no code-review-graph server"; fi
+  for _i in .graphifyignore .code-review-graphignore; do
+    grep -q '^# kg-setup-start' "$_r/$_i" 2> /dev/null && ok "$_i" || bad "$_i lacks the kg-setup block"
+  done
+  graph_ignored "$_r" && ok "graphify-out/ is gitignored" || bad "graphify-out/ is not gitignored"
+  [ -f "$_r/.github/instructions/code-review-graph.instructions.md" ] && ok "agent instructions" || bad "agent instructions missing"
+  [ -f "$_r/docs/agents/knowledge-graph.md" ] && ok "docs/agents/knowledge-graph.md" || bad "docs/agents/knowledge-graph.md missing"
+  [ -f "$_r/.code-review-graph/graph.db" ] && ok "code-review-graph built" || bad "code-review-graph not built"
+  [ -f "$_r/graphify-out/graph.json" ] && ok "graphify built" || bad "graphify not built"
+}
+
+doctor_ws() {
+  CUR_REPO=""
+  grep -q '"chat.useClaudeHooks"[[:space:]]*:[[:space:]]*false' "$1" && ok "$(rel "$1"): chat.useClaudeHooks false" \
+    || bad "$(rel "$1"): chat.useClaudeHooks not false (Claude hooks would fire twice)"
+}
+
+cmd_doctor() {
+  need_base
+  CRG_BIN=$(find_bin code-review-graph) || CRG_BIN=""
+  GFY_BIN=$(find_bin graphify) || GFY_BIN=""
+  collect_targets "$@"
+  [ -s "$REPO_LIST" ] || die "no git repositories found"
+  title "kg-setup $KIT_VERSION: doctor"
+  [ -n "$CRG_BIN" ] && ok "code-review-graph $("$CRG_BIN" --version 2> /dev/null | awk '{ print $NF }') at $(rel "$CRG_BIN")" || bad "code-review-graph not installed"
+  [ -n "$GFY_BIN" ] && ok "graphify at $(rel "$GFY_BIN")" || bad "graphify not installed"
+  each_line "$REPO_LIST" doctor_repo
+  [ -s "$WS_LIST" ] && { title "Workspaces"; each_line "$WS_LIST" doctor_ws; }
+  CUR_REPO=""
+  if [ "$USER_CFG" = 1 ]; then
+    title "User-level"
+    if [ -d "$HOME/.copilot" ]; then
+      jq -e '.mcpServers["code-review-graph"]' "$HOME/.copilot/mcp-config.json" > /dev/null 2>&1 \
+        && ok "~/.copilot/mcp-config.json code-review-graph" || bad "~/.copilot/mcp-config.json lacks code-review-graph"
+    fi
+    if [ -L "$HOME/.local/bin/kg-setup" ] || [ -x "$HOME/.local/bin/kg-setup" ]; then ok "kg-setup on ~/.local/bin"
+    else note "kg-setup not linked (run: $KIT_DIR/bin/kg-setup self-install)"; fi
+  fi
+  # Per-repo graph freshness, then the shared tools/resources/log trailer once.
+  title "Graph status"
+  _trailer=""
+  while IFS= read -r _r; do [ -f "$_r/.githooks/kg-hook.sh" ] && _trailer=$_r; done < "$REPO_LIST"
+  while IFS= read -r _r; do
+    [ -f "$_r/.githooks/kg-hook.sh" ] || continue
+    (cd "$_r" && sh .githooks/kg-hook.sh status 2>&1) | awk '/^== tools/ { exit } { print }'
+  done < "$REPO_LIST" | awk '/^== / { k = $0; sub(/  \(HEAD.*/, "", k); skip = (k in seen); seen[k] = 1 } !skip'   # status may list workspace siblings too
+  [ -n "$_trailer" ] && (cd "$_trailer" && sh .githooks/kg-hook.sh status 2>&1) | awk '/^== tools/ { p = 1 } p'
+  title "Result"
+  if [ "$NFAIL" = 0 ]; then echo "  all checks passed"; else echo "  $NFAIL problem(s); 'kg-setup install' fixes them"; exit 1; fi
+}
+
+# ================================================================ uninstall ==
+uninstall_repo() {
+  _r=$1; CUR_REPO=$_r
+  title "$_r"
+  _hd=$(hooks_dir "$_r")
+  for _h in $GIT_HOOKS; do strip_git_hook "$_hd" "$_h"; done
+  if [ "$(git -C "$_r" config --get kg-kit.hookspathset)" = true ]; then
+    # Hooks the kit carried over from .git/hooks become active there again once
+    # hooksPath is unset, so drop the identical copies in .githooks.
+    _gd=$(git -C "$_r" rev-parse --git-common-dir 2> /dev/null); case "$_gd" in /*) ;; *) _gd="$_r/$_gd" ;; esac
+    for _h in "$_r"/.githooks/*; do
+      [ -f "$_h" ] && cmp -s "$_h" "$_gd/hooks/$(basename "$_h")" && remove_file "$_h"
+    done
+    set_hooks_path "$_r" unset
+  fi
+  [ "$DRY" = 1 ] || { git -C "$_r" config --unset merge.graphify.driver 2> /dev/null; git -C "$_r" config --unset merge.graphify.name 2> /dev/null; }
+  remove_file "$_r/.githooks/kg-lib.sh"; remove_file "$_r/.githooks/kg-hook.sh"
+  [ "$DRY" = 1 ] || rmdir "$_r/.githooks" 2> /dev/null
+  for _j in code-review-graph.json graphify.json; do
+    grep -q 'kg-hook.sh' "$_r/.github/hooks/$_j" 2> /dev/null && remove_file "$_r/.github/hooks/$_j"
+  done
+  for _c in settings.json settings.local.json; do
+    grep -qE "$GRAPH_RE" "$_r/.claude/$_c" 2> /dev/null && json_apply "$_r/.claude/$_c" "$JQ_CLAUDE_DEL"
+  done
+  if [ -f "$_r/.vscode/mcp.json" ]; then
+    if jq -e 'del(.servers["code-review-graph"]) | (.servers // {}) == {} and (del(.servers) == {})' "$_r/.vscode/mcp.json" > /dev/null 2>&1; then
+      remove_file "$_r/.vscode/mcp.json"
+    else
+      json_apply "$_r/.vscode/mcp.json" 'del(.servers["code-review-graph"])'
+    fi
+  fi
+  for _i in .graphifyignore .code-review-graphignore; do
+    remove_text_block "$_r/$_i" '^# kg-setup-start' '^# kg-setup-end$' "$TPL/ignore/defaults.txt"
+  done
+  remove_text_block "$_r/.gitignore" '^# kg-gitignore-start' '^# kg-gitignore-end$'
+  for _d in "$_r/.github/instructions/code-review-graph.instructions.md" "$_r/docs/agents/knowledge-graph.md"; do
+    grep -q 'kg-kit:managed' "$_d" 2> /dev/null && remove_file "$_d"
+  done
+  if [ "$PURGE" = 1 ]; then
+    if [ "$DRY" = 1 ]; then act "[dry] purge" "graphify-out/ .code-review-graph/"
+    else rm -rf "$_r/graphify-out" "$_r/.code-review-graph"; act "purged" "graphify-out/ .code-review-graph/"; fi
+  fi
+  note "left in place: chat.useClaudeHooks in .vscode/settings.json (harmless)"
+}
+
+cmd_uninstall() {
+  need_base
+  collect_targets "$@"
+  [ -s "$REPO_LIST" ] || die "no git repositories found"
+  title "kg-setup $KIT_VERSION: uninstall$([ "$DRY" = 1 ] && echo ' (dry run)')"
+  sed 's/^/  repo  /' "$REPO_LIST"
+  [ "$DRY" = 1 ] || confirm "Remove the knowledge-graph setup from the above?" || die "aborted"
+  each_line "$REPO_LIST" uninstall_repo
+  if [ "$PURGE" = 1 ] && [ "$USER_CFG" = 1 ] && [ -f "$HOME/.copilot/mcp-config.json" ]; then
+    CUR_REPO=""; title "User-level"
+    json_apply "$HOME/.copilot/mcp-config.json" 'del(.mcpServers["code-review-graph"])'
+  fi
+  summary
+}
+
+# ================================================================== restore ==
+cmd_restore() {
+  _dir=${1:-}
+  [ -n "$_dir" ] || { ls -1t "${KG_KIT_BACKUP_DIR:-$HOME/.cache/kg-kit/backups}" 2> /dev/null | head -20; die "usage: kg-setup restore <backup-dir> (recent ones listed above)"; }
+  case "$_dir" in /*) ;; *) [ -d "$_dir" ] || _dir="${KG_KIT_BACKUP_DIR:-$HOME/.cache/kg-kit/backups}/$_dir" ;; esac
+  [ -f "$_dir/manifest.txt" ] || die "no manifest.txt in $_dir"
+  title "Restore from $_dir"
+  cat "$_dir/manifest.txt"
+  confirm "Restore these files (created ones are deleted)?" || die "aborted"
+  # Replay newest-first so a set followed by an unset unwinds in the right order.
+  _rev="$WORK/manifest.rev"; awk '{ l[NR] = $0 } END { for (i = NR; i > 0; i--) print l[i] }' "$_dir/manifest.txt" > "$_rev"
+  while IFS= read -r _line; do
+    _p=${_line#* }
+    case "$_line" in
+      "modified "*) [ -f "$_dir/files$_p" ] || continue
+        if [ "$DRY" = 1 ]; then act "[dry] restore" "$(rel "$_p")"; else backup_file "$_p"; cp -p "$_dir/files$_p" "$_p"; act "restored" "$(rel "$_p")"; fi ;;
+      "created "*) remove_file "$_p" ;;
+      "hookspath-set "*) CUR_REPO=$_p; set_hooks_path "$_p" unset ;;
+      "hookspath-unset "*) CUR_REPO=$_p; set_hooks_path "$_p" set ;;
+    esac
+  done < "$_rev"
+  CUR_REPO=""
+  summary
+}
+
+# ============================================================= self-install ==
+vscode_user_dirs() {
+  for _d in "$HOME/Library/Application Support/Code/User" "$HOME/Library/Application Support/Code - Insiders/User" \
+            "$HOME/.config/Code/User" "$HOME/.config/Code - Insiders/User"; do
+    [ -d "$_d" ] && printf '%s\n' "$_d"
+  done
+}
+
+cmd_self_install() {
+  need_base
+  CUR_REPO=""
+  title "kg-setup $KIT_VERSION: self-install (kit: $(rel "$KIT_DIR"))"
+  mkdir -p "$HOME/.local/bin"
+  if [ "$(readlink "$HOME/.local/bin/kg-setup" 2> /dev/null)" != "$KIT_DIR/bin/kg-setup" ]; then
+    if [ "$DRY" = 1 ]; then act "[dry] link" "~/.local/bin/kg-setup"
+    else ln -sfn "$KIT_DIR/bin/kg-setup" "$HOME/.local/bin/kg-setup"; act "linked" "~/.local/bin/kg-setup -> $(rel "$KIT_DIR/bin/kg-setup")"; fi
+  fi
+  case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) warn "~/.local/bin is not on PATH; add: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;; esac
+  # agent skill: "set up knowledge graphs here" in Copilot (VS Code / CLI) or Claude Code
+  put_file "$KIT_DIR/integrations/skill/SKILL.md" "$HOME/.copilot/skills/kg-setup/SKILL.md"
+  # ~/.claude/skills only on request: VS Code reads it too and would list the skill twice
+  [ "$CLAUDE" = yes ] && put_file "$KIT_DIR/integrations/skill/SKILL.md" "$HOME/.claude/skills/kg-setup/SKILL.md"
+  # VS Code: /kg-setup prompt + "Tasks: Run Task" entries, for every installed VS Code flavour
+  vscode_user_dirs > "$WORK/vsc"
+  while IFS= read -r _u; do
+    put_file "$KIT_DIR/integrations/vscode/kg-setup.prompt.md" "$_u/prompts/kg-setup.prompt.md"
+    if json_apply "$_u/tasks.json" \
+        '.version = (.version // "2.0.0") | .tasks = (((.tasks // []) | map(select((.label // "") | startswith("Knowledge graphs:") | not))) + $t[0].tasks)' \
+        --slurpfile t "$KIT_DIR/integrations/vscode/tasks.json"; then :
+    else warn "$(rel "$_u/tasks.json") has comments; merge $(rel "$KIT_DIR/integrations/vscode/tasks.json") by hand"; fi
+  done < "$WORK/vsc"
+  ensure_tools
+  summary
+  printf '\nOne-click options now available:\n'
+  printf '  terminal   kg-setup            (in a repo or workspace folder; add --dry-run to preview)\n'
+  printf '  VS Code    Tasks: Run Task -> "Knowledge graphs: set up / repair this workspace"\n'
+  printf '  chat       /kg-setup  (prompt)   or ask "set up knowledge graphs here" (skill)\n'
+}
+
+cmd_self_update() {
+  [ -d "$KIT_DIR/.git" ] || die "$KIT_DIR is not a git clone"
+  git -C "$KIT_DIR" pull --ff-only || die "git pull failed"
+  exec "$KIT_DIR/bin/kg-setup" self-install --yes
+}
+
+# ===================================================================== main ==
+usage() {
+  cat << EOF
+kg-setup $KIT_VERSION: self-updating knowledge graphs (graphify + code-review-graph)
+for GitHub Copilot (VS Code chat, Copilot CLI) and Claude Code.
+
+Usage: kg-setup [command] [options] [PATH...]
+
+PATH is a repo directory, a folder holding a *.code-workspace, or a
+*.code-workspace file (all its folders are set up). Default: current directory.
+
+Commands:
+  install       (default) set up / repair / upgrade the given repos
+  doctor        verify the setup and show graph status (exit 1 on problems)
+  uninstall     remove what kg-setup added (graph data kept unless --purge)
+  restore DIR   undo a run from its backup dir (kg-setup restore lists recent ones)
+  self-install  link kg-setup into ~/.local/bin, add the Copilot skill, the VS Code
+                /kg-setup prompt and "Knowledge graphs:" tasks, install missing CLIs
+  self-update   git pull the kit, then self-install
+  version
+
+Options:
+  -n, --dry-run     show what would change, change nothing
+  -y, --yes         no confirmation prompt
+  -f, --force       also replace customised instructions/docs files
+      --no-build    skip the initial graph build/refresh
+      --no-claude   leave .claude/ alone      --claude   create .claude/settings.json hooks
+      --no-mcp      leave MCP configs alone
+      --no-user     leave user-level config (~/.copilot) alone
+      --no-tools    never install missing CLIs
+      --no-workspace  don't expand *.code-workspace files found in PATH
+      --purge       uninstall: also delete graph data and the user-level MCP entry
+
+Environment: KG_CRG_TOOLS (comma list or "all"), KG_KIT_BACKUP_DIR.
+Kit: $KIT_DIR
+EOF
+}
+
+CMD=install
+case "${1:-}" in
+  install|doctor|uninstall|restore|self-install|self-update) CMD=$1; shift ;;
+  version|--version|-V) echo "kg-setup $KIT_VERSION ($KIT_DIR)"; exit 0 ;;
+  help|-h|--help) usage; exit 0 ;;
+esac
+ARGS_FILE="$WORK/args"; : > "$ARGS_FILE"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes) YES=1 ;;
+    -f|--force) FORCE=1 ;;
+    --no-build) BUILD=0 ;;
+    --no-claude) CLAUDE=no ;;
+    --claude) CLAUDE=yes ;;
+    --no-mcp) MCP=0 ;;
+    --no-user) USER_CFG=0 ;;
+    --no-tools) TOOLS=0 ;;
+    --no-workspace) WS=0 ;;
+    --purge) PURGE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option: $1 (see kg-setup --help)" ;;
+    *) printf '%s\n' "$1" >> "$ARGS_FILE" ;;
+  esac
+  shift
+done
+# re-read positional args (paths may contain spaces)
+set --
+while IFS= read -r _p; do set -- "$@" "$_p"; done < "$ARGS_FILE"
+
+case "$CMD" in
+  install) cmd_install "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  uninstall) cmd_uninstall "$@" ;;
+  restore) cmd_restore "$@" ;;
+  self-install) cmd_self_install ;;
+  self-update) cmd_self_update ;;
+esac

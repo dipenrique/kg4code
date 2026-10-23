@@ -1,0 +1,18 @@
+
+# kg-setup-start: agent/tooling config is not product code (docs/agents/knowledge-graph.md)
+.githooks/
+.github/hooks/
+.claude/
+.agents/
+.codebuddy/
+.cursor/
+.gemini/
+.kilo/
+.kiro/
+.qoder/
+.opencode/
+.parcel-cache/
+CODEBUDDY.md
+GEMINI.md
+QODER.md
+# kg-setup-end

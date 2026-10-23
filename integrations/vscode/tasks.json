@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Knowledge graphs: set up / repair this workspace",
+      "detail": "kg-setup: graphify + code-review-graph hooks, MCP, instructions, initial build (idempotent)",
+      "type": "process",
+      "command": "${userHome}/.local/bin/kg-setup",
+      "args": ["install", "--yes", "${workspaceFolder}"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Knowledge graphs: preview setup (dry run)",
+      "detail": "kg-setup --dry-run: show what would change",
+      "type": "process",
+      "command": "${userHome}/.local/bin/kg-setup",
+      "args": ["install", "--dry-run", "${workspaceFolder}"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "Knowledge graphs: doctor",
+      "detail": "kg-setup doctor: verify hooks, MCP, ignores and graph freshness",
+      "type": "process",
+      "command": "${userHome}/.local/bin/kg-setup",
+      "args": ["doctor", "${workspaceFolder}"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    }
+  ]
+}

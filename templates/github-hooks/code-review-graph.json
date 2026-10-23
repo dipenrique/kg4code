@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "f=\"$(git rev-parse --show-toplevel 2>/dev/null)/.githooks/kg-hook.sh\"; if [ -f \"$f\" ]; then sh \"$f\" session-start; else echo '{}'; fi",
+        "timeoutSec": 10
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "f=\"$(git rev-parse --show-toplevel 2>/dev/null)/.githooks/kg-hook.sh\"; if [ -f \"$f\" ]; then sh \"$f\" agent-stop; else echo '{}'; fi",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}

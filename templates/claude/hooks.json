@@ -1,0 +1,48 @@
+{
+  "SessionStart": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "f=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}/.githooks/kg-hook.sh\"; if [ -f \"$f\" ]; then sh \"$f\" session-start; else echo '{}'; fi",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "f=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}/.githooks/kg-hook.sh\"; if [ -f \"$f\" ]; then sh \"$f\" agent-stop; else echo '{}'; fi",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
+  "PreToolUse": [
+    {
+      "matcher": "Bash|Grep",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "f=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}/.githooks/kg-hook.sh\"; if [ -f \"$f\" ]; then sh \"$f\" guard search; else echo '{}'; fi",
+          "timeout": 5
+        }
+      ]
+    },
+    {
+      "matcher": "Read|Glob",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "f=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}/.githooks/kg-hook.sh\"; if [ -f \"$f\" ]; then sh \"$f\" guard read; else echo '{}'; fi",
+          "timeout": 5
+        }
+      ]
+    }
+  ]
+}

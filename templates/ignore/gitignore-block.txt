@@ -1,0 +1,5 @@
+
+# kg-gitignore-start: local knowledge-graph caches (docs/agents/knowledge-graph.md)
+graphify-out/
+.code-review-graph/
+# kg-gitignore-end
