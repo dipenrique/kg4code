@@ -13,19 +13,18 @@ It does the same for every repo in a multi-root workspace. Both graphs refresh t
 
 ## One-time install (per machine)
 
-The repo ([dipenrique/kg4code](https://github.com/dipenrique/kg4code)) is private, so use an authenticated method:
-
 ```sh
-# GitHub CLI (uses your gh login)
-gh api repos/dipenrique/kg4code/contents/install.sh -H 'Accept: application/vnd.github.raw' | sh
-
-# or plain git (SSH key)
-git clone git@github.com:dipenrique/kg4code.git ~/.local/share/kg-kit && ~/.local/share/kg-kit/install.sh
+curl -fsSL https://raw.githubusercontent.com/dipenrique/kg4code/main/install.sh | sh
 ```
 
-If the repo is made public, `curl -fsSL https://raw.githubusercontent.com/dipenrique/kg4code/main/install.sh | sh` also works.
-`install.sh` clones the kit to `~/.local/share/kg-kit`, or fast-forwards an existing clone, then runs `kg-setup self-install`.
-It tries SSH, then `gh`, then HTTPS credentials. Pass self-install flags after `sh -s --`, e.g. `| sh -s -- --claude`.
+Then open any repo or workspace and run `kg-setup`, or use one of the one-click options below.
+
+- **Options**: put self-install flags after `sh -s --`, e.g. `… | sh -s -- --claude` (also installs the skill for Claude Code) or `… | sh -s -- --dry-run` (preview only).
+- **Update later**: run `kg-setup self-update`, or re-run the one-liner; both fast-forward the clone.
+- **What it does**: clones [dipenrique/kg4code](https://github.com/dipenrique/kg4code) to `~/.local/share/kg-kit` (`KG_KIT_DIR` overrides; `KG_KIT_REF` pins a branch or tag), then runs `kg-setup self-install`. The script body runs only after the whole file has downloaded.
+- **Prerequisites**: git, bash, jq, perl and awk. It stops with an install hint if any are missing. graphify and code-review-graph are installed for you.
+- **Read before running**: `curl -fsSL …/install.sh -o install.sh && less install.sh && sh install.sh`.
+- **Without curl**: `git clone https://github.com/dipenrique/kg4code.git ~/.local/share/kg-kit && ~/.local/share/kg-kit/install.sh`.
 
 `self-install` does five things:
 
