@@ -13,10 +13,19 @@ It does the same for every repo in a multi-root workspace. Both graphs refresh t
 
 ## One-time install (per machine)
 
+The repo ([dipenrique/kg4code](https://github.com/dipenrique/kg4code)) is private, so use an authenticated method:
+
 ```sh
-git clone <this-repo> ~/.local/share/kg-kit     # or copy the folder there
-~/.local/share/kg-kit/bin/kg-setup self-install
+# GitHub CLI (uses your gh login)
+gh api repos/dipenrique/kg4code/contents/install.sh -H 'Accept: application/vnd.github.raw' | sh
+
+# or plain git (SSH key)
+git clone git@github.com:dipenrique/kg4code.git ~/.local/share/kg-kit && ~/.local/share/kg-kit/install.sh
 ```
+
+If the repo is made public, `curl -fsSL https://raw.githubusercontent.com/dipenrique/kg4code/main/install.sh | sh` also works.
+`install.sh` clones the kit to `~/.local/share/kg-kit`, or fast-forwards an existing clone, then runs `kg-setup self-install`.
+It tries SSH, then `gh`, then HTTPS credentials. Pass self-install flags after `sh -s --`, e.g. `| sh -s -- --claude`.
 
 `self-install` does five things:
 
@@ -75,6 +84,7 @@ Env: `KG_CRG_TOOLS` (comma-separated MCP tools, or `all`), `KG_KIT_BACKUP_DIR`.
 ## Layout
 
 ```text
+install.sh                    bootstrap: clone/update the kit, then self-install
 bin/kg-setup                  the installer (bash 3.2+, needs git, jq, perl, awk)
 templates/githooks/           kg-lib.sh, kg-hook.sh (runtime), prelude + crg hook blocks
 templates/github-hooks/       Copilot agent hook JSONs
